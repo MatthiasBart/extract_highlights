@@ -4,6 +4,8 @@ this script extracts highlights of pdfs into markdown format. this has helped me
 
 > This script was coded using Claude AI. 
 
+![Showcase](showcase.gif)
+
 ## Installation
 
 Clone the git repository and follow the steps in the setup.md. If you are using a mac and have problems with your python installation, you can use pyenv as a python version manager.
