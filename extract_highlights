@@ -1,0 +1,437 @@
+#!/usr/bin/env python
+
+import fitz  # PyMuPDF
+import sys
+import argparse
+from PIL import Image
+import io
+from tqdm import tqdm
+from difflib import SequenceMatcher
+
+def find_and_mark_all_highlights(paragraph, highlighted_texts, threshold=0.6):
+    """
+    Find all highlighted texts within the paragraph and mark them with ==.
+    Processes all highlights at once to avoid nested markers.
+    
+    Args:
+        paragraph: The full paragraph text
+        highlighted_texts: List of texts that should be highlighted
+        threshold: Similarity threshold (0-1) for fuzzy matching
+    
+    Returns:
+        Paragraph with all highlighted sections marked with ==
+    """
+    # Clean up paragraph
+    para_clean = ' '.join(paragraph.split())
+    
+    if not highlighted_texts:
+        return para_clean
+    
+    # Find positions of all highlights in the paragraph
+    matches = []  # List of (start_pos, end_pos, matched_text)
+    
+    for highlighted_text in highlighted_texts:
+        high_clean = ' '.join(highlighted_text.split())
+        
+        if not high_clean:
+            continue
+        
+        # Try exact match first
+        pos = para_clean.find(high_clean)
+        if pos != -1:
+            matches.append((pos, pos + len(high_clean), high_clean))
+            continue
+        
+        # Fuzzy matching: slide a window through the paragraph
+        high_words = high_clean.split()
+        para_words = para_clean.split()
+        
+        best_match = None
+        best_ratio = 0
+        best_start_word = 0
+        best_end_word = 0
+        
+        # Try different window sizes around the expected length
+        for window_size in range(max(1, len(high_words) - 2), len(high_words) + 3):
+            for i in range(len(para_words) - window_size + 1):
+                window_words = para_words[i:i + window_size]
+                window = ' '.join(window_words)
+                ratio = SequenceMatcher(None, high_clean.lower(), window.lower()).ratio()
+                
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_match = window
+                    best_start_word = i
+                    best_end_word = i + window_size
+        
+        # If we found a good enough match, convert word positions to character positions
+        if best_ratio >= threshold and best_match:
+            # Build character position by reconstructing text up to the match
+            text_before = ' '.join(para_words[:best_start_word])
+            matched_text = ' '.join(para_words[best_start_word:best_end_word])
+            
+            start_char = len(text_before) + (1 if text_before else 0)  # +1 for space after previous word
+            end_char = start_char + len(matched_text)
+            
+            matches.append((start_char, end_char, matched_text))
+    
+    # Sort matches by position and merge overlapping ones
+    matches.sort(key=lambda x: x[0])
+    
+    merged_matches = []
+    for start, end, text in matches:
+        if merged_matches and start <= merged_matches[-1][1] + 1:  # +1 to allow for adjacent matches
+            # Overlapping or adjacent - merge them
+            prev_start, prev_end, prev_text = merged_matches[-1]
+            new_end = max(end, prev_end)
+            merged_text = para_clean[prev_start:new_end]
+            merged_matches[-1] = (prev_start, new_end, merged_text)
+        else:
+            merged_matches.append((start, end, text))
+    
+    # Build result string with markers
+    if not merged_matches:
+        return para_clean
+    
+    result = []
+    last_pos = 0
+    
+    for start, end, text in merged_matches:
+        # Add text before highlight
+        if start > last_pos:
+            result.append(para_clean[last_pos:start])
+        
+        # Add highlighted text with markers
+        # Ensure we're at word boundaries
+        highlighted_portion = para_clean[start:end]
+        result.append(f"=={highlighted_portion}==")
+        last_pos = end
+    
+    # Add remaining text
+    if last_pos < len(para_clean):
+        result.append(para_clean[last_pos:])
+    
+    return ''.join(result)
+
+
+def find_text_in_paragraph(paragraph, highlighted_text, threshold=0.6):
+    """
+    Find the highlighted text within the paragraph and mark it with ==.
+    Uses fuzzy matching to handle OCR inconsistencies.
+    
+    Args:
+        paragraph: The full paragraph text
+        highlighted_text: The text that should be highlighted
+        threshold: Similarity threshold (0-1) for fuzzy matching
+    
+    Returns:
+        Paragraph with highlighted section marked with ==
+    """
+    # Clean up texts
+    para_clean = ' '.join(paragraph.split())
+    high_clean = ' '.join(highlighted_text.split())
+    
+    if not high_clean:
+        return para_clean
+    
+    # Try exact match first
+    if high_clean in para_clean:
+        return para_clean.replace(high_clean, f"=={high_clean}==", 1)
+    
+    # Fuzzy matching: slide a window through the paragraph
+    high_words = high_clean.split()
+    para_words = para_clean.split()
+    
+    best_match = None
+    best_ratio = 0
+    best_start = 0
+    best_end = 0
+    
+    # Try different window sizes around the expected length
+    for window_size in range(max(1, len(high_words) - 3), len(high_words) + 4):
+        for i in range(len(para_words) - window_size + 1):
+            window = ' '.join(para_words[i:i + window_size])
+            ratio = SequenceMatcher(None, high_clean.lower(), window.lower()).ratio()
+            
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = window
+                best_start = i
+                best_end = i + window_size
+    
+    # If we found a good enough match, mark it
+    if best_ratio >= threshold and best_match:
+        result_parts = []
+        if best_start > 0:
+            result_parts.append(' '.join(para_words[:best_start]))
+        result_parts.append(f"=={best_match}==")
+        if best_end < len(para_words):
+            result_parts.append(' '.join(para_words[best_end:]))
+        return ' '.join(result_parts)
+    
+    # If no good match found, just return paragraph with highlight at best guess
+    if best_match:
+        return para_clean.replace(best_match, f"=={best_match}==", 1)
+    
+    # Fallback: mark the whole thing
+    return f"=={para_clean}=="
+
+
+def find_highlights_by_color(pdf_path, highlight_color_range=None, min_area=100):
+    """
+    Extract text from visually highlighted regions in a PDF.
+    This works for 'flattened' highlights that are rendered as colored shapes.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        highlight_color_range: Tuple of (min_color, max_color) in RGB to detect
+                               Default detects yellow highlights
+        min_area: Minimum area of highlight region to consider (in pixels)
+    """
+    if highlight_color_range is None:
+        # Default: detect yellow/orange highlights (common in Remarkable)
+        # RGB ranges: (R_min, G_min, B_min), (R_max, G_max, B_max)
+        highlight_color_range = ((200, 200, 0), (255, 255, 150))
+    
+    highlights = []
+    
+    try:
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        
+        for page_num in tqdm(range(total_pages), desc="Processing pages", unit="page"):
+            page = doc[page_num]
+            
+            # Render page to image at higher resolution for better detection
+            mat = fitz.Matrix(2, 2)  # 2x zoom for better quality
+            pix = page.get_pixmap(matrix=mat)
+            
+            # Convert to PIL Image for color analysis
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            pixels = img.load()
+            
+            # Find regions with highlight colors
+            highlight_regions = []
+            width, height = img.size
+            
+            # Scan for highlighted areas
+            visited = set()
+            for y in range(0, height, 5):  # Sample every 5 pixels for speed
+                for x in range(0, width, 5):
+                    if (x, y) in visited:
+                        continue
+                    
+                    r, g, b = pixels[x, y]
+                    min_r, min_g, min_b = highlight_color_range[0]
+                    max_r, max_g, max_b = highlight_color_range[1]
+                    
+                    # Check if pixel is in highlight color range
+                    if (min_r <= r <= max_r and 
+                        min_g <= g <= max_g and 
+                        min_b <= b <= max_b):
+                        
+                        # Found a highlighted pixel, find the bounding box
+                        min_x, max_x = x, x
+                        min_y, max_y = y, y
+                        
+                        # Expand region (simple flood fill approximation)
+                        for dy in range(-20, 21):
+                            for dx in range(-100, 101):
+                                px, py = x + dx, y + dy
+                                if 0 <= px < width and 0 <= py < height:
+                                    try:
+                                        pr, pg, pb = pixels[px, py]
+                                        if (min_r <= pr <= max_r and 
+                                            min_g <= pg <= max_g and 
+                                            min_b <= pb <= max_b):
+                                            min_x = min(min_x, px)
+                                            max_x = max(max_x, px)
+                                            min_y = min(min_y, py)
+                                            max_y = max(max_y, py)
+                                            visited.add((px, py))
+                                    except:
+                                        pass
+                        
+                        area = (max_x - min_x) * (max_y - min_y)
+                        if area > min_area:
+                            # Convert back to PDF coordinates (accounting for zoom)
+                            rect = fitz.Rect(min_x/2, min_y/2, max_x/2, max_y/2)
+                            highlight_regions.append(rect)
+            
+            # Merge overlapping and nearby regions (especially for multi-line highlights)
+            merged_regions = []
+            for rect in highlight_regions:
+                merged = False
+                for i, existing in enumerate(merged_regions):
+                    # Check if rectangles overlap or are vertically close (same highlight spanning lines)
+                    expanded_rect = rect + (-5, -10, 5, 10)  # Expand to catch nearby highlights
+                    expanded_existing = existing + (-5, -10, 5, 10)
+                    
+                    if expanded_rect.intersects(expanded_existing):
+                        merged_regions[i] = existing | rect  # Union of rectangles
+                        merged = True
+                        break
+                if not merged:
+                    merged_regions.append(rect)
+            
+            # Group highlights by paragraph
+            # First, identify unique paragraphs and collect all highlights within each
+            paragraphs_dict = {}  # key: paragraph identifier, value: list of highlight rects
+            
+            for rect in merged_regions:
+                # Get all text blocks on the page
+                all_blocks = page.get_text("blocks")
+                
+                # Find blocks that intersect with or are near the highlight
+                paragraph_blocks = []
+                
+                for block in all_blocks:
+                    block_rect = fitz.Rect(block[0], block[1], block[2], block[3])
+                    
+                    # Expand vertically to catch full paragraph
+                    highlight_area = rect + (0, -20, 0, 20)
+                    
+                    if block_rect.intersects(highlight_area):
+                        paragraph_blocks.append((block[1], block))
+                
+                # Sort blocks by vertical position
+                paragraph_blocks.sort(key=lambda x: x[0])
+                
+                # Create paragraph identifier based on block positions and content
+                if paragraph_blocks:
+                    # Use position and first few words as identifier
+                    first_block_text = paragraph_blocks[0][1][4].strip()[:50]
+                    para_id = (round(paragraph_blocks[0][1][1]), round(paragraph_blocks[-1][1][3]), first_block_text)
+                    
+                    if para_id not in paragraphs_dict:
+                        paragraphs_dict[para_id] = {
+                            'blocks': paragraph_blocks,
+                            'highlights': []
+                        }
+                    
+                    paragraphs_dict[para_id]['highlights'].append(rect)
+            
+            # Now process each unique paragraph once
+            for para_id, para_data in paragraphs_dict.items():
+                paragraph_blocks = para_data['blocks']
+                highlight_rects = para_data['highlights']
+                
+                # Build full paragraph text
+                paragraph_parts = []
+                for _, block in paragraph_blocks:
+                    block_text = block[4].strip()
+                    if block_text:
+                        paragraph_parts.append(block_text)
+                
+                full_paragraph = ' '.join(paragraph_parts)
+                
+                # Extract all highlighted texts from this paragraph
+                highlighted_texts = []
+                for rect in highlight_rects:
+                    highlighted_text = page.get_text("text", clip=rect).strip()
+                    if highlighted_text:
+                        highlighted_texts.append(highlighted_text)
+                
+                # Mark all highlights at once (not iteratively)
+                marked_text = find_and_mark_all_highlights(full_paragraph, highlighted_texts)
+                
+                if marked_text.strip():
+                    highlights.append({
+                        'page': page_num + 1,
+                        'text': marked_text.strip(),
+                        'rect': highlight_rects[0]  # Use first highlight rect as reference
+                    })
+        
+        doc.close()
+        return highlights
+    
+    except FileNotFoundError:
+        print(f"Error: File '{pdf_path}' not found.")
+        return []
+    except Exception as e:
+        print(f"Error processing PDF: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Extract highlighted text from Remarkable PDFs',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  %(prog)s document.pdf
+  %(prog)s document.pdf --color 200,200,0 255,255,150
+  %(prog)s document.pdf -o highlights.txt
+  %(prog)s document.pdf --color 150,200,255 200,230,255 -o output.txt
+        '''
+    )
+    
+    parser.add_argument('pdf_path', help='Path to the PDF file')
+    parser.add_argument(
+        '--color', 
+        nargs=2, 
+        metavar=('MIN_RGB', 'MAX_RGB'),
+        help='Custom color range for highlights (e.g., --color 200,200,0 255,255,150)'
+    )
+    parser.add_argument(
+        '-o', '--out',
+        dest='output_file',
+        help='Output file path to save highlights (if not specified, prints to console)'
+    )
+    
+    args = parser.parse_args()
+    
+    pdf_path = args.pdf_path
+    
+    # Parse custom color range if provided
+    highlight_color_range = None
+    if args.color:
+        try:
+            min_color = tuple(map(int, args.color[0].split(',')))
+            max_color = tuple(map(int, args.color[1].split(',')))
+            highlight_color_range = (min_color, max_color)
+            print(f"Using custom color range: {min_color} to {max_color}\n")
+        except:
+            print("Invalid color format. Using default yellow detection.")
+    
+    print("Scanning PDF for highlighted regions...")
+    print("(This may take a while for large PDFs)\n")
+    
+    highlights = find_highlights_by_color(pdf_path, highlight_color_range)
+    
+    # Prepare output text
+    output_lines = []
+    
+    if highlights:
+        output_lines.append(f"Found {len(highlights)} highlight(s):\n")
+        
+        for i, highlight in enumerate(highlights, 1):
+            output_lines.append(f"Seite: {highlight['page']}")
+            output_lines.append(f"Highlight: {i}")
+            output_lines.append(highlight['text'])
+            output_lines.append("")  # Empty line between highlights
+    else:
+        output_lines.append("No highlights found in the PDF.")
+        output_lines.append("\nTips:")
+        output_lines.append("- Try adjusting the color range with --color option")
+        output_lines.append("- Remarkable highlights are often yellow/orange or light blue")
+        output_lines.append("- Check what color your highlights appear in the PDF")
+    
+    output_text = '\n'.join(output_lines)
+    
+    # Write to file or print to console
+    if args.output_file:
+        try:
+            with open(args.output_file, 'w', encoding='utf-8') as f:
+                f.write(output_text)
+            print(f"\nHighlights saved to: {args.output_file}")
+        except Exception as e:
+            print(f"\nError writing to file: {e}")
+            print("\nOutput:")
+            print(output_text)
+    else:
+        print(output_text)
+
+if __name__ == "__main__":
+    main()
